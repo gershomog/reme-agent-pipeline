@@ -8,10 +8,13 @@ This script performs the full evaluation pipeline:
 4. Generate metrics and statistics
 
 Usage:
-    python bench/halumem/eval_reme.py --data_path /Users/yuli/workspace/HaluMem/data/HaluMem-Long.jsonl --version v1 \
+    python bench/halumem/eval_reme.py --data_path /Users/yuli/workspace/HaluMem/data/HaluMem-Long.jsonl \
         --top_k 20 --user_num 100 --max_concurrency 20
-    python bench/halumem/eval_reme.py --data_path ./HaluMem-Long.jsonl --version v1 \
+    python bench/halumem/eval_reme.py --data_path ./HaluMem-Long.jsonl \
         --top_k 20 --user_num 100 --max_concurrency 20
+
+    python bench/halumem/eval_reme.py --data_path /Users/yuli/workspace/HaluMem/data/tmp_14.jsonl \
+        --top_k 20 --user_num 1 --max_concurrency 1
 """
 
 import asyncio
@@ -99,10 +102,9 @@ async def process_user_stage1(
     user_data: dict,
     top_k_value: int,
     save_path: str,
-    version: str,
 ):
     """Stage 1: Process user data through ReMe (summary + retrieve)."""
-    user_name = extract_user_name(user_data["persona_info"]) + f"_{version}"
+    user_name = extract_user_name(user_data["persona_info"])
     sessions = user_data["sessions"]
 
     tmp_dir = os.path.join(save_path, "tmp")
@@ -653,14 +655,13 @@ def aggregate_eval_results(eval_results):
 
 async def main_async(
     data_path: str,
-    version: str = "default",
     top_k: int = 20,
     user_num: int = 1,
     max_concurrency: int = 2,
 ):
     """Main evaluation pipeline."""
     frame = "reme"
-    save_path = f"bench_results/{frame}-{version}/"
+    save_path = f"bench_results/{frame}/"
     os.makedirs(save_path, exist_ok=True)
 
     output_file_stage1 = os.path.join(save_path, f"{frame}_eval_results.jsonl")
@@ -699,7 +700,7 @@ async def main_async(
                 return {"uuid": uuid, "status": "cached", "path": tmp_file}
             
             print(f"[{idx}/{total_users}] Processing user {uuid}...")
-            result = await process_user_stage1(user_data, top_k, save_path, version)
+            result = await process_user_stage1(user_data, top_k, save_path)
             print(f"[{idx}/{total_users}] ✅ Finished {uuid} ({result['status']})")
             return result
 
@@ -878,13 +879,12 @@ async def main_async(
 
 def main(
     data_path: str,
-    version: str = "default",
     top_k: int = 20,
     user_num: int = 1,
     max_concurrency: int = 2,
 ):
     """Synchronous entry point."""
-    asyncio.run(main_async(data_path, version, top_k, user_num, max_concurrency))
+    asyncio.run(main_async(data_path, top_k, user_num, max_concurrency))
 
 
 if __name__ == "__main__":
@@ -896,12 +896,6 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="Path to HaluMem data file (e.g., HaluMem-medium.jsonl)",
-    )
-    parser.add_argument(
-        "--version",
-        type=str,
-        default="test",
-        help="Version identifier for this evaluation run (default: test)",
     )
     parser.add_argument(
         "--top_k",
@@ -925,7 +919,6 @@ if __name__ == "__main__":
 
     main(
         data_path=args.data_path,
-        version=args.version,
         top_k=args.top_k,
         user_num=args.user_num,
         max_concurrency=args.max_concurrency,
