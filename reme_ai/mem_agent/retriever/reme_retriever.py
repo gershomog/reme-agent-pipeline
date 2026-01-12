@@ -29,24 +29,24 @@ class ReMeRetriever(BaseMemoryAgent):
             await op.call()
             return str(op.output)
 
-    async def build_messages1(self) -> List[Message]:
-        """Build messages with system prompt and user message."""
-        meta_memory_info = await self._read_meta_memories()
-        system_prompt = self.prompt_format(
-            prompt_name="system_prompt",
-            now_time=get_now_time(),
-            meta_memory_info=meta_memory_info,
-        )
+    # async def build_messages1(self) -> List[Message]:
+    #     """Build messages with system prompt and user message."""
+    #     meta_memory_info = await self._read_meta_memories()
+    #     system_prompt = self.prompt_format(
+    #         prompt_name="system_prompt",
+    #         now_time=get_now_time(),
+    #         meta_memory_info=meta_memory_info,
+    #     )
 
-        messages = [Message(role=Role.SYSTEM, content=system_prompt)]
-        if self.context.get("query"):
-            messages.append(Message(role=Role.USER, content=self.context.query))
-        elif self.context.get("messages"):
-            messages.extend([Message(**m) for m in self.context.messages])
-        else:
-            raise ValueError("input must have either `query` or `messages`")
+    #     messages = [Message(role=Role.SYSTEM, content=system_prompt)]
+    #     if self.context.get("query"):
+    #         messages.append(Message(role=Role.USER, content=self.context.query))
+    #     elif self.context.get("messages"):
+    #         messages.extend([Message(**m) for m in self.context.messages])
+    #     else:
+    #         raise ValueError("input must have either `query` or `messages`")
 
-        return messages
+    #     return messages
 
     async def build_messages(self) -> List[Message]:
         """Build messages with system prompt and user message."""
