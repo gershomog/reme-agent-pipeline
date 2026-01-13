@@ -1,516 +1,662 @@
 """
-Simplified evaluation script for ReMe on HaluMem benchmark - Question Answering only.
+HaluMem Benchmark Evaluator for ReMe - Question Answering
 
-This script performs a simplified evaluation pipeline:
-1. Load HaluMem data
-2. Process each user's sessions with ReMe (summary + retrieve)
-3. Evaluate question answering only
-4. Generate metrics and statistics
+A modular evaluation pipeline that:
+1. Loads HaluMem benchmark data
+2. Processes user sessions through ReMe (summarization + retrieval)
+3. Evaluates question answering performance
+4. Generates comprehensive metrics
 
 Usage:
-    python bench/halumem/eval_reme_simple.py --data_path /Users/yuli/workspace/HaluMem/data/HaluMem-Medium.jsonl \
+    python bench/halumem/eval_reme_simple.py \
+        --data_path /path/to/HaluMem-Medium.jsonl \
         --top_k 20 --user_num 100 --max_concurrency 20
 """
 
 import asyncio
-import copy
 import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
-from eval_tools import (
-    _PROMPTS,
-    evaluation_for_question,
-    evaluation_for_question2,
-)
-from llms import llm_request
+from eval_tools import evaluation_for_question2
 from reme_ai.core.enumeration import MemoryType
 from reme_ai.core.schema import MemoryNode
 from reme_ai.reme import ReMe
 
-# Initialize ReMe
-reme: ReMe = ReMe()
+
+# ==================== Configuration ====================
+
+@dataclass
+class EvalConfig:
+    """Evaluation configuration parameters."""
+    data_path: str
+    top_k: int = 20
+    user_num: int = 1
+    max_concurrency: int = 2
+    batch_size: int = 20
+    output_dir: str = "bench_results/reme_simple"
 
 
-def extract_user_name(persona_info: str):
-    """Extract user name from persona info."""
-    match = re.search(r"Name:\s*(.*?); Gender:", persona_info)
-    if match:
-        username = match.group(1).strip()
-        return username
-    else:
-        raise ValueError("No name found.")
+# ==================== Utilities ====================
 
-
-def iter_jsonl(file_path: str):
-    """Iterate over lines in a JSONL file."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
-
-
-# ==================== Main Processing ====================
-
-
-async def add_memory_async(user_id: str, messages: list[dict]) -> tuple[list[MemoryNode], list, bool, float]:
-    """Add memory to ReMe system asynchronously."""
-    start = time.time()
-    memory_nodes, agent_messages, success = await reme.summary_v2(messages=messages, user_id=user_id)
-    duration_ms = (time.time() - start) * 1000
-    return memory_nodes, agent_messages, success, duration_ms
-
-
-async def search_memory_async(query: str, user_id: str, top_k: int = 20):
-    """Search memory and get LLM response directly."""
-    start = time.time()
-    memories, agent_messages, success = await reme.retrieve_v2(query=query, user_id=user_id, top_k=top_k)
+class DataLoader:
+    """Handles loading and parsing of HaluMem data."""
     
-    # Format the context
-    context = f"User: {user_id}\nMemories:\n{memories}"
+    @staticmethod
+    def load_jsonl(file_path: str) -> list[dict]:
+        """Load all entries from a JSONL file."""
+        with open(file_path, "r", encoding="utf-8") as f:
+            return [json.loads(line.strip()) for line in f if line.strip()]
     
-    # Get LLM response directly
-    prompt = f"Based on the following context, answer the question.\n\nContext:\n{context}\n\nQuestion: {query}\n\nAnswer:"
-    response = await llm_request(prompt)
+    @staticmethod
+    def extract_user_name(persona_info: str) -> str:
+        """Extract user name from persona info string."""
+        match = re.search(r"Name:\s*(.*?); Gender:", persona_info)
+        if not match:
+            raise ValueError(f"No name found in persona_info: {persona_info}")
+        return match.group(1).strip()
     
-    duration_ms = (time.time() - start) * 1000
-    return response, agent_messages, success, duration_ms
-
-
-async def process_user_stage1(
-    user_data: dict,
-    top_k_value: int,
-    save_path: str,
-):
-    """Process user data through ReMe (summary + retrieve + QA evaluation only)."""
-    user_name = extract_user_name(user_data["persona_info"])
-    sessions = user_data["sessions"]
-
-    tmp_dir = os.path.join(save_path, "tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    tmp_file = os.path.join(tmp_dir, f"{user_data['uuid']}.json")
-
-    new_user_data = {
-        "uuid": user_data["uuid"],
-        "user_name": user_name,
-        "sessions": [],
-    }
-
-    for idx, session in enumerate(sessions):
-        logger.info(f"Processing user {user_name}: session {idx}/{len(sessions)}")
-        new_session = {
-            "memory_points": session["memory_points"],
-            "dialogue": session["dialogue"],
-        }
-
-        # Format dialogue
-        dialogue = session["dialogue"]
-        formatted_dialogue = [
+    @staticmethod
+    def format_dialogue_messages(dialogue: list[dict]) -> list[dict]:
+        """Format dialogue into ReMe message format."""
+        return [
             {
                 "role": turn["role"],
                 "content": turn["content"],
-                "time_created": datetime.strptime(turn["timestamp"], "%b %d, %Y, %H:%M:%S")
+                "time_created": datetime.strptime(
+                    turn["timestamp"], "%b %d, %Y, %H:%M:%S"
+                )
                 .replace(tzinfo=timezone.utc)
                 .strftime("%Y-%m-%d %H:%M:%S"),
             }
             for turn in dialogue
         ]
-
-        # Process in batches
-        result = []
-        all_agent_messages = []
-        all_success_flags = []
-        total_duration_ms = 0
-        batch_size = 20
-
-        for i in range(0, len(formatted_dialogue), batch_size):
-            batch = formatted_dialogue[i : i + batch_size]
-            batch_result, agent_messages, success, duration_ms = await add_memory_async(
-                user_id=user_name,
-                messages=batch,
+    
+    @staticmethod
+    def format_dialogue_for_eval(dialogue: list[dict], user_name: str = None) -> str:
+        """Format dialogue into string for evaluation."""
+        formatted_turns = []
+        for turn in dialogue:
+            timestamp = datetime.strptime(
+                turn["timestamp"], "%b %d, %Y, %H:%M:%S"
+            ).replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Use user_name if role is 'user' and user_name is provided
+            role = user_name if turn['role'] == 'user' and user_name else turn['role']
+            
+            formatted_turns.append(
+                f"Role: {role}\n"
+                f"Content: {turn['content']}\n"
+                f"Time: {timestamp}"
             )
-            if batch_result:
-                result.extend(batch_result)
-            all_agent_messages.append({
-                "batch_index": i // batch_size,
-                "messages": [msg.model_dump() if hasattr(msg, 'model_dump') else str(msg) for msg in agent_messages] if agent_messages else []
-            })
-            all_success_flags.append({
-                "batch_index": i // batch_size,
-                "success": success
-            })
+        return "\n\n".join(formatted_turns)
+
+
+class FileManager:
+    """Manages file I/O operations."""
+    
+    def __init__(self, base_dir: str):
+        self.base_dir = Path(base_dir)
+        self.tmp_dir = self.base_dir / "tmp"
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+    
+    def get_user_dir(self, user_name: str) -> Path:
+        """Get the directory path for a user."""
+        user_dir = self.tmp_dir / user_name
+        user_dir.mkdir(parents=True, exist_ok=True)
+        return user_dir
+    
+    def get_session_file(self, user_name: str, session_id: int) -> Path:
+        """Get the file path for a specific session."""
+        return self.get_user_dir(user_name) / f"session_{session_id}.json"
+    
+    def save_session(self, user_name: str, session_id: int, data: dict):
+        """Save session data to file."""
+        file_path = self.get_session_file(user_name, session_id)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"✅ Saved session {session_id} to {file_path}")
+    
+    def load_session(self, user_name: str, session_id: int) -> dict | None:
+        """Load session data from file."""
+        file_path = self.get_session_file(user_name, session_id)
+        if not file_path.exists():
+            return None
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    
+    def user_has_cache(self, user_name: str) -> bool:
+        """Check if user has cached results."""
+        user_dir = self.get_user_dir(user_name)
+        return any(f.name.startswith("session_") and f.suffix == ".json" 
+                  for f in user_dir.iterdir())
+    
+    def combine_results(self, output_file: str):
+        """Combine all user session files into a single JSONL file."""
+        with open(output_file, "w", encoding="utf-8") as f_out:
+            for user_dir in self.tmp_dir.iterdir():
+                if not user_dir.is_dir():
+                    continue
+                
+                session_files = sorted([
+                    f for f in user_dir.iterdir() 
+                    if f.name.startswith("session_") and f.suffix == ".json"
+                ])
+                
+                if not session_files:
+                    continue
+                
+                # Load first session to get user metadata
+                with open(session_files[0], "r", encoding="utf-8") as f_in:
+                    first_session = json.load(f_in)
+                
+                user_data = {
+                    "uuid": first_session["uuid"],
+                    "user_name": first_session["user_name"],
+                    "sessions": []
+                }
+                
+                # Load all sessions
+                for session_file in session_files:
+                    with open(session_file, "r", encoding="utf-8") as f_in:
+                        session_data = json.load(f_in)
+                        # Remove redundant user metadata
+                        session_data.pop("uuid", None)
+                        session_data.pop("user_name", None)
+                        user_data["sessions"].append(session_data)
+                
+                f_out.write(json.dumps(user_data, ensure_ascii=False) + "\n")
+
+
+# ==================== Memory Operations ====================
+
+class MemoryProcessor:
+    """Handles ReMe memory operations."""
+    
+    def __init__(self, reme: ReMe):
+        self.reme = reme
+    
+    async def add_memories(
+        self, 
+        user_id: str, 
+        messages: list[dict],
+        batch_size: int = 20
+    ) -> tuple[list[str], list[list[dict]], float]:
+        """
+        Add memories in batches and return extracted memory contents.
+        
+        Returns:
+            tuple: (extracted_memories, agent_messages, total_duration_ms)
+        """
+        added_memories: list[MemoryNode] = []
+        deleted_memories: list[str] = []
+        all_agent_messages: list = []
+        total_duration_ms = 0
+        for i in range(0, len(messages), batch_size):
+            batch = messages[i:i + batch_size]
+            start = time.time()
+            
+            memory_nodes, agent_messages, success = await self.reme.summary_v2(
+                messages=batch, 
+                user_id=user_id
+            )
+            
+            duration_ms = (time.time() - start) * 1000
             total_duration_ms += duration_ms
+            
+            # Save agent messages for this batch
+            if agent_messages:
+                all_agent_messages.extend(agent_messages)
+            
+            if memory_nodes:
+                for node in memory_nodes:
+                    if isinstance(node, MemoryNode) and node.memory_type == MemoryType.HISTORY:
+                        continue
 
-        duration_ms = total_duration_ms
+                    if isinstance(node, MemoryNode):
+                        added_memories.append(node)
 
-        # Extract memory content
-        memories = []
-        for memory_node in result:
-            if isinstance(memory_node, MemoryNode) and memory_node.memory_type is not MemoryType.HISTORY:
-                memories.append(memory_node.content)
+                    if isinstance(node, str):
+                        deleted_memories.append(node)
 
-        if session.get("is_generated_qa_session", False):
-            new_session["add_dialogue_duration_ms"] = duration_ms
-            new_session["summary_agent_messages"] = all_agent_messages
-            new_session["summary_success_flags"] = all_success_flags
-            new_session["is_generated_qa_session"] = True
-            del new_session["dialogue"]
-            del new_session["memory_points"]
-            new_user_data["sessions"].append(new_session)
-            continue
+        extracted_memories = deleted_memories
+        extracted_memories += ["[delete]" + n.format_memory() for n in added_memories if n.memory_id in deleted_memories]
+        extracted_memories += ["[add]" + n.format_memory() for n in added_memories if n.memory_id not in deleted_memories]
+        return extracted_memories, all_agent_messages, total_duration_ms
+    
+    async def search_memory(
+        self, 
+        query: str, 
+        user_id: str, 
+        top_k: int = 20
+    ) -> tuple[str, list, float]:
+        """
+        Search memory and return response.
+        
+        Returns:
+            tuple: (response, agent_messages, duration_ms)
+        """
+        start = time.time()
+        response, agent_messages, success = await self.reme.retrieve_v2(
+            query=query, 
+            user_id=user_id, 
+            top_k=top_k
+        )
+        duration_ms = (time.time() - start) * 1000
+        return response, agent_messages, duration_ms
 
-        # Store extracted memories
-        new_session["extracted_memories"] = memories
-        new_session["add_dialogue_duration_ms"] = duration_ms
-        new_session["summary_agent_messages"] = all_agent_messages
-        new_session["summary_success_flags"] = all_success_flags
 
-        # Process questions
-        if "questions" not in session:
-            new_user_data["sessions"].append(new_session)
-            continue
+# ==================== Evaluation ====================
 
-        new_session["questions"] = []
-
-        for qa in session["questions"]:
-            response, agent_messages, success, duration_ms = await search_memory_async(
+class QuestionAnsweringEvaluator:
+    """Evaluates question answering performance."""
+    
+    def __init__(self, memory_processor: MemoryProcessor, top_k: int):
+        self.memory_processor = memory_processor
+        self.top_k = top_k
+    
+    async def evaluate_questions(
+        self,
+        questions: list[dict],
+        user_name: str,
+        uuid: str,
+        session_id: int,
+        formatted_dialogue: str
+    ) -> list[dict]:
+        """Evaluate all questions for a session."""
+        results = []
+        
+        for qa in questions:
+            # Search memory for answer
+            response, agent_messages, duration_ms = await self.memory_processor.search_memory(
                 query=qa["question"],
                 user_id=user_name,
-                top_k=top_k_value,
+                top_k=self.top_k
             )
-
-            new_qa = copy.deepcopy(qa)
-            new_qa["system_response"] = response
-            new_qa["search_duration_ms"] = duration_ms
-            new_qa["retrieve_agent_messages"] = [msg.model_dump() if hasattr(msg, 'model_dump') else str(msg) for msg in agent_messages] if agent_messages else []
-            new_qa["retrieve_success"] = success
-
-            new_session["questions"].append(new_qa)
-
-        # ==================== Evaluation for this session ====================
-        session_eval_results = {
-            "question_answering_records": [],
-        }
-
-        uuid = user_data["uuid"]
-
-        # Evaluate Question Answering
-        if "questions" in new_session:
-            logger.info(f"Evaluating Question Answering for session {idx}...")
             
-            # Format dialogue for evaluation
-            # Format: Each turn contains role, content, and time_created
-            dialogue_for_eval = []
-            for turn in dialogue:
-                dialogue_for_eval.append(
-                    f"Role: {turn['role']}\n"
-                    f"Content: {turn['content']}\n"
-                    f"Time: {datetime.strptime(turn['timestamp'], '%b %d, %Y, %H:%M:%S').replace(tzinfo=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-            formatted_dialogue_str = "\n\n".join(dialogue_for_eval)
+            # Evaluate response
+            evidence_text = "\n".join([e["memory_content"] for e in qa["evidence"]])
+            eval_result = await evaluation_for_question2(
+                qa["question"],
+                qa["answer"],
+                evidence_text,
+                response,
+                formatted_dialogue
+            )
             
-            for qa in new_session["questions"]:
-                new_qa = copy.deepcopy(qa)
-                new_qa["uuid"] = uuid
-                new_qa["session_id"] = idx
-
-                result = await evaluation_for_question2(
-                    qa["question"],
-                    qa["answer"],
-                    "\n".join([i["memory_content"] for i in qa["evidence"]]),
-                    qa["system_response"],
-                    formatted_dialogue_str,
-                )
-                result_type = result.get("evaluation_result")
-                reasoning = result.get("reasoning", "")
-                new_qa["result_type"] = result_type
-                new_qa["question_answering_reasoning"] = reasoning
-                session_eval_results["question_answering_records"].append(new_qa)
-
-        # Store evaluation results in session
-        new_session["evaluation_results"] = session_eval_results
-
-        new_user_data["sessions"].append(new_session)
-
-        # Save results
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(new_user_data, f, ensure_ascii=False, indent=2)
-        session_size = len(new_user_data["sessions"])
-        logger.info(f"✅ Saved user {user_name} to {tmp_file} session_size={session_size}")
-
-    logger.info(f"✅ Saved user {user_name} to {tmp_file} all!")
-    return {"uuid": user_data["uuid"], "status": "ok", "path": tmp_file}
+            # Build result record
+            qa_result = {
+                **qa,
+                "uuid": uuid,
+                "session_id": session_id,
+                "system_response": response,
+                "retrieve_messages": [m.model_dump() for m in agent_messages],
+                "search_duration_ms": duration_ms,
+                "result_type": eval_result.get("evaluation_result"),
+                "question_answering_reasoning": eval_result.get("reasoning", "")
+            }
+            results.append(qa_result)
+        
+        return results
 
 
-# ==================== Evaluation Aggregation ====================
-
-
-def aggregate_eval_results(eval_results):
-    """Aggregate evaluation results and compute metrics (QA only)."""
+class MetricsAggregator:
+    """Aggregates evaluation metrics."""
     
-    # Question-Answering Evaluation
-    correct_qa_num = 0
-    hallucination_qa_num = 0
-    omission_qa_num = 0
-    qa_num = 0
-    qa_valid_num = 0
-
-    for item in eval_results["question_answering_records"]:
-        item["is_valid"] = True
-        qa_num += 1
-
-        if item["result_type"] not in ["Correct", "Hallucination", "Omission"]:
-            item["is_valid"] = False
-            continue
-
-        if item["result_type"] == "Correct":
-            correct_qa_num += 1
-        elif item["result_type"] == "Hallucination":
-            hallucination_qa_num += 1
-        elif item["result_type"] == "Omission":
-            omission_qa_num += 1
-
-        qa_valid_num += 1
-
-    if qa_num > 0:
-        eval_results["overall_score"]["question_answering"]["correct_qa_ratio(all)"] = correct_qa_num / qa_num
-        eval_results["overall_score"]["question_answering"]["hallucination_qa_ratio(all)"] = (
-            hallucination_qa_num / qa_num
-        )
-        eval_results["overall_score"]["question_answering"]["omission_qa_ratio(all)"] = omission_qa_num / qa_num
-    else:
-        eval_results["overall_score"]["question_answering"]["correct_qa_ratio(all)"] = 0
-        eval_results["overall_score"]["question_answering"]["hallucination_qa_ratio(all)"] = 0
-        eval_results["overall_score"]["question_answering"]["omission_qa_ratio(all)"] = 0
-
-    if qa_valid_num > 0:
-        eval_results["overall_score"]["question_answering"]["correct_qa_ratio(valid)"] = correct_qa_num / qa_valid_num
-        eval_results["overall_score"]["question_answering"]["hallucination_qa_ratio(valid)"] = (
-            hallucination_qa_num / qa_valid_num
-        )
-        eval_results["overall_score"]["question_answering"]["omission_qa_ratio(valid)"] = omission_qa_num / qa_valid_num
-    else:
-        eval_results["overall_score"]["question_answering"]["correct_qa_ratio(valid)"] = 0
-        eval_results["overall_score"]["question_answering"]["hallucination_qa_ratio(valid)"] = 0
-        eval_results["overall_score"]["question_answering"]["omission_qa_ratio(valid)"] = 0
-
-    eval_results["overall_score"]["question_answering"]["qa_valid_num"] = qa_valid_num
-    eval_results["overall_score"]["question_answering"]["qa_num"] = qa_num
-
-    return eval_results
+    @staticmethod
+    def compute_qa_metrics(qa_records: list[dict]) -> dict[str, Any]:
+        """Compute question answering metrics."""
+        total = len(qa_records)
+        if total == 0:
+            return {
+                "correct_qa_ratio(all)": 0,
+                "hallucination_qa_ratio(all)": 0,
+                "omission_qa_ratio(all)": 0,
+                "correct_qa_ratio(valid)": 0,
+                "hallucination_qa_ratio(valid)": 0,
+                "omission_qa_ratio(valid)": 0,
+                "qa_valid_num": 0,
+                "qa_num": 0
+            }
+        
+        correct = 0
+        hallucination = 0
+        omission = 0
+        valid = 0
+        
+        for qa in qa_records:
+            result_type = qa.get("result_type", "")
+            
+            if result_type in ["Correct", "Hallucination", "Omission"]:
+                valid += 1
+                if result_type == "Correct":
+                    correct += 1
+                elif result_type == "Hallucination":
+                    hallucination += 1
+                elif result_type == "Omission":
+                    omission += 1
+        
+        metrics = {
+            "correct_qa_ratio(all)": correct / total,
+            "hallucination_qa_ratio(all)": hallucination / total,
+            "omission_qa_ratio(all)": omission / total,
+            "qa_valid_num": valid,
+            "qa_num": total
+        }
+        
+        if valid > 0:
+            metrics.update({
+                "correct_qa_ratio(valid)": correct / valid,
+                "hallucination_qa_ratio(valid)": hallucination / valid,
+                "omission_qa_ratio(valid)": omission / valid
+            })
+        else:
+            metrics.update({
+                "correct_qa_ratio(valid)": 0,
+                "hallucination_qa_ratio(valid)": 0,
+                "omission_qa_ratio(valid)": 0
+            })
+        
+        return metrics
+    
+    @staticmethod
+    def compute_time_metrics(eval_results_file: str) -> dict[str, float]:
+        """Compute timing metrics from evaluation results."""
+        add_duration = 0
+        search_duration = 0
+        
+        with open(eval_results_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                user_data = json.loads(line)
+                
+                for session in user_data["sessions"]:
+                    add_duration += session.get("add_dialogue_duration_ms", 0)
+                    
+                    eval_results = session.get("evaluation_results", {})
+                    for qa in eval_results.get("question_answering_records", []):
+                        search_duration += qa.get("search_duration_ms", 0)
+        
+        # Convert to minutes
+        return {
+            "add_dialogue_duration_time": add_duration / 1000 / 60,
+            "search_memory_duration_time": search_duration / 1000 / 60,
+            "total_duration_time": (add_duration + search_duration) / 1000 / 60
+        }
 
 
 # ==================== Main Pipeline ====================
 
-
-async def main_async(
-    data_path: str,
-    top_k: int = 20,
-    user_num: int = 1,
-    max_concurrency: int = 2,
-):
-    """Main evaluation pipeline - simplified for QA only."""
-    frame = "reme_simple"
-    save_path = f"bench_results/{frame}/"
-    os.makedirs(save_path, exist_ok=True)
-
-    output_file_stage1 = os.path.join(save_path, f"{frame}_eval_results.jsonl")
-    output_file_final = os.path.join(save_path, f"{frame}_eval_stat_result.json")
-
-    start_time = time.time()
-    await reme.vector_store.delete_all()
-
-    # ==================== Stage 1: Data Processing ====================
-    print("\n" + "=" * 80)
-    print("PROCESSING DATA WITH ReMe (Simplified - QA Only)")
-    print(f"Max Concurrency: {max_concurrency}")
-    print("=" * 80)
-
-    tmp_dir = os.path.join(save_path, "tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    # Load all user data
-    user_data_list = list(iter_jsonl(data_path))
-    total_users = min(len(user_data_list), user_num)
-    user_data_list = user_data_list[:total_users]
-
-    print(f"Processing {total_users} users with max concurrency {max_concurrency}...")
+class HaluMemEvaluator:
+    """Main evaluator orchestrating the entire pipeline."""
     
-    # Create semaphore to limit concurrency
-    semaphore = asyncio.Semaphore(max_concurrency)
-
-    async def process_single_user(idx: int, user_data: dict):
-        """Process a single user with semaphore control."""
-        async with semaphore:
-            uuid = user_data['uuid']
-            tmp_file = os.path.join(tmp_dir, f"{uuid}.json")
+    def __init__(self, config: EvalConfig):
+        self.config = config
+        self.reme = ReMe()
+        self.file_manager = FileManager(config.output_dir)
+        self.memory_processor = MemoryProcessor(self.reme)
+        self.qa_evaluator = QuestionAnsweringEvaluator(
+            self.memory_processor, 
+            config.top_k
+        )
+        self.data_loader = DataLoader()
+    
+    async def process_session(
+        self,
+        session: dict,
+        session_id: int,
+        user_name: str,
+        uuid: str
+    ) -> dict:
+        """Process a single session."""
+        session_data = {
+            "uuid": uuid,
+            "user_name": user_name,
+            "session_id": session_id,
+            "memory_points": session["memory_points"]
+        }
+        
+        # Skip generated QA sessions
+        if session.get("is_generated_qa_session", False):
+            session_data["is_generated_qa_session"] = True
+            return session_data
+        
+        # Format and add dialogue to memory
+        dialogue = session["dialogue"]
+        formatted_messages = self.data_loader.format_dialogue_messages(dialogue)
+        
+        extracted_memories, agent_messages, duration_ms = await self.memory_processor.add_memories(
+            user_id=user_name,
+            messages=formatted_messages,
+            batch_size=self.config.batch_size
+        )
+        
+        session_data.update({
+            "dialogue": dialogue,
+            "extracted_memories": extracted_memories,
+            "summary_messages": [m.model_dump() for m in agent_messages],
+            "add_dialogue_duration_ms": duration_ms
+        })
+        
+        # Evaluate questions if present
+        if "questions" in session:
+            formatted_dialogue = self.data_loader.format_dialogue_for_eval(dialogue, user_name)
+            qa_results = await self.qa_evaluator.evaluate_questions(
+                questions=session["questions"],
+                user_name=user_name,
+                uuid=uuid,
+                session_id=session_id,
+                formatted_dialogue=formatted_dialogue
+            )
             
-            if os.path.exists(tmp_file):
-                print(f"⚡ Skipping user {uuid} ({idx}/{total_users}) — cached result found.")
-                return {"uuid": uuid, "status": "cached", "path": tmp_file}
+            session_data["evaluation_results"] = {
+                "question_answering_records": qa_results
+            }
+        
+        return session_data
+    
+    async def process_user(self, user_data: dict) -> dict:
+        """Process all sessions for a user."""
+        user_name = self.data_loader.extract_user_name(user_data["persona_info"])
+        uuid = user_data["uuid"]
+        
+        logger.info(f"Processing user: {user_name}")
+        
+        for idx, session in enumerate(user_data["sessions"]):
+            logger.info(f"  Session {idx + 1}/{len(user_data['sessions'])}")
             
-            print(f"[{idx}/{total_users}] Processing user {uuid}...")
-            result = await process_user_stage1(user_data, top_k, save_path)
-            print(f"[{idx}/{total_users}] ✅ Finished {uuid} ({result['status']})")
-            return result
-
-    # Process users in parallel with controlled concurrency
-    tasks = [process_single_user(idx, user_data) for idx, user_data in enumerate(user_data_list, 1)]
-    await asyncio.gather(*tasks)
-
-    # Combine all results into final output
-    with open(output_file_stage1, "w", encoding="utf-8") as f_out:
-        for file in os.listdir(tmp_dir):
-            if file.endswith(".json"):
-                file_path = os.path.join(tmp_dir, file)
-                with open(file_path, "r", encoding="utf-8") as f_in:
-                    data = json.load(f_in)
-                    f_out.write(json.dumps(data, ensure_ascii=False) + "\n")
-
-    elapsed_stage1 = time.time() - start_time
-    print(f"\n✅ Processing completed in {elapsed_stage1:.2f}s")
-    print(f"✅ Results saved to: {output_file_stage1}")
-
-    # ==================== Aggregate Results ====================
-    print("\n" + "=" * 80)
-    print("AGGREGATING EVALUATION RESULTS")
-    print("=" * 80)
-
-    # Calculate time consuming
-    add_dialogue_duration_time = 0
-    search_memory_duration_time = 0
-
-    for user_data in iter_jsonl(output_file_stage1):
-        sessions = user_data["sessions"]
-
-        for session in sessions:
-            if "add_dialogue_duration_ms" in session:
-                add_dialogue_duration_time += session["add_dialogue_duration_ms"]
-
-            if "questions" in session:
-                for question in session["questions"]:
-                    if "search_duration_ms" in question:
-                        search_memory_duration_time += question["search_duration_ms"]
-
-    add_dialogue_duration_time = add_dialogue_duration_time / 1000 / 60
-    search_memory_duration_time = search_memory_duration_time / 1000 / 60
-
-    print("\n🔄 Aggregating all user results...")
-
-    eval_results = {
-        "overall_score": {
-            "question_answering": {},
-            "time_consuming": {
-                "add_dialogue_duration_time": add_dialogue_duration_time,
-                "search_memory_duration_time": search_memory_duration_time,
-                "total_duration_time": add_dialogue_duration_time + search_memory_duration_time,
+            session_data = await self.process_session(
+                session=session,
+                session_id=idx,
+                user_name=user_name,
+                uuid=uuid
+            )
+            
+            self.file_manager.save_session(user_name, idx, session_data)
+        
+        return {"uuid": uuid, "user_name": user_name, "status": "ok"}
+    
+    async def run_evaluation(self):
+        """Run the complete evaluation pipeline."""
+        start_time = time.time()
+        
+        # Clear existing data
+        await self.reme.vector_store.delete_all()
+        
+        # Load user data
+        all_users = self.data_loader.load_jsonl(self.config.data_path)
+        users_to_process = all_users[:self.config.user_num]
+        
+        print("\n" + "=" * 80)
+        print("HALUMEM EVALUATION - QUESTION ANSWERING")
+        print(f"Users: {len(users_to_process)} | Concurrency: {self.config.max_concurrency}")
+        print("=" * 80 + "\n")
+        
+        # Process users with concurrency control
+        semaphore = asyncio.Semaphore(self.config.max_concurrency)
+        
+        async def process_with_cache_check(idx: int, user_data: dict):
+            async with semaphore:
+                user_name = self.data_loader.extract_user_name(user_data["persona_info"])
+                
+                # Check cache
+                if self.file_manager.user_has_cache(user_name):
+                    print(f"⚡ [{idx}/{len(users_to_process)}] Skipping {user_name} (cached)")
+                    return {"user_name": user_name, "status": "cached"}
+                
+                print(f"🔄 [{idx}/{len(users_to_process)}] Processing {user_name}...")
+                result = await self.process_user(user_data)
+                print(f"✅ [{idx}/{len(users_to_process)}] Completed {user_name}")
+                return result
+        
+        tasks = [
+            process_with_cache_check(idx, user) 
+            for idx, user in enumerate(users_to_process, 1)
+        ]
+        await asyncio.gather(*tasks)
+        
+        # Combine results
+        output_file = os.path.join(self.config.output_dir, "eval_results.jsonl")
+        self.file_manager.combine_results(output_file)
+        
+        elapsed = time.time() - start_time
+        print(f"\n✅ Processing completed in {elapsed:.2f}s")
+        print(f"📁 Results: {output_file}\n")
+        
+        # Aggregate metrics
+        await self.aggregate_and_report(output_file)
+    
+    async def aggregate_and_report(self, results_file: str):
+        """Aggregate results and generate final report."""
+        print("=" * 80)
+        print("AGGREGATING METRICS")
+        print("=" * 80 + "\n")
+        
+        # Collect all QA records
+        qa_records = []
+        with open(results_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                user_data = json.loads(line)
+                
+                for session in user_data["sessions"]:
+                    if session.get("is_generated_qa_session"):
+                        continue
+                    
+                    eval_results = session.get("evaluation_results", {})
+                    qa_records.extend(
+                        eval_results.get("question_answering_records", [])
+                    )
+        
+        # Compute metrics
+        qa_metrics = MetricsAggregator.compute_qa_metrics(qa_records)
+        time_metrics = MetricsAggregator.compute_time_metrics(results_file)
+        
+        final_results = {
+            "overall_score": {
+                "question_answering": qa_metrics,
+                "time_consuming": time_metrics
             },
-        },
-        "question_answering_records": [],
-    }
+            "question_answering_records": qa_records
+        }
+        
+        # Save final report
+        report_file = os.path.join(self.config.output_dir, "eval_statistics.json")
+        with open(report_file, "w", encoding="utf-8") as f:
+            json.dump(final_results, f, ensure_ascii=False, indent=4)
+        
+        print(f"📊 Statistics saved to: {report_file}\n")
+        
+        # Print summary
+        self._print_summary(qa_metrics, time_metrics)
+    
+    def _print_summary(self, qa_metrics: dict, time_metrics: dict):
+        """Print evaluation summary."""
+        print("=" * 80)
+        print("EVALUATION SUMMARY")
+        print("=" * 80 + "\n")
+        
+        print("📊 Question Answering:")
+        print(f"  Correct (all):       {qa_metrics['correct_qa_ratio(all)']:.4f}")
+        print(f"  Hallucination (all): {qa_metrics['hallucination_qa_ratio(all)']:.4f}")
+        print(f"  Omission (all):      {qa_metrics['omission_qa_ratio(all)']:.4f}")
+        print(f"  Correct (valid):     {qa_metrics['correct_qa_ratio(valid)']:.4f}")
+        print(f"  Hallucination (valid): {qa_metrics['hallucination_qa_ratio(valid)']:.4f}")
+        print(f"  Omission (valid):    {qa_metrics['omission_qa_ratio(valid)']:.4f}")
+        print(f"  Valid/Total:         {qa_metrics['qa_valid_num']}/{qa_metrics['qa_num']}")
+        
+        print(f"\n⏱️  Time Metrics:")
+        print(f"  Memory Addition:  {time_metrics['add_dialogue_duration_time']:.2f} min")
+        print(f"  Memory Search:    {time_metrics['search_memory_duration_time']:.2f} min")
+        print(f"  Total:            {time_metrics['total_duration_time']:.2f} min")
+        print("\n" + "=" * 80)
 
-    # Extract QA records from all users
-    for user_data in iter_jsonl(output_file_stage1):
-        for session in user_data["sessions"]:
-            if session.get("is_generated_qa_session", False):
-                continue
-            
-            if "evaluation_results" in session:
-                eval_results["question_answering_records"].extend(
-                    session["evaluation_results"].get("question_answering_records", [])
-                )
 
-    eval_results = aggregate_eval_results(eval_results)
-
-    with open(output_file_final, "w", encoding="utf-8") as f:
-        json.dump(eval_results, f, ensure_ascii=False, indent=4)
-
-    elapsed_total = time.time() - start_time
-    print(f"\n✅ All done in {elapsed_total:.2f}s. Results saved to {output_file_final}")
-
-    # Print summary
-    print("\n" + "=" * 80)
-    print("EVALUATION SUMMARY (Question Answering Only)")
-    print("=" * 80)
-
-    print(f"\n📊 Question Answering:")
-    print(
-        f"  - Correct (all): {eval_results['overall_score']['question_answering'].get('correct_qa_ratio(all)', 0):.4f}",
-    )
-    print(
-        f"  - Hallucination (all): {eval_results['overall_score']['question_answering'].get('hallucination_qa_ratio(all)', 0):.4f}",
-    )
-    print(
-        f"  - Omission (all): {eval_results['overall_score']['question_answering'].get('omission_qa_ratio(all)', 0):.4f}",
-    )
-    print(
-        f"  - Correct (valid): {eval_results['overall_score']['question_answering'].get('correct_qa_ratio(valid)', 0):.4f}",
-    )
-    print(
-        f"  - Hallucination (valid): {eval_results['overall_score']['question_answering'].get('hallucination_qa_ratio(valid)', 0):.4f}",
-    )
-    print(
-        f"  - Omission (valid): {eval_results['overall_score']['question_answering'].get('omission_qa_ratio(valid)', 0):.4f}",
-    )
-    print(
-        f"  - Valid QA: {eval_results['overall_score']['question_answering'].get('qa_valid_num', 0)}/{eval_results['overall_score']['question_answering'].get('qa_num', 0)}",
-    )
-
-    print(f"\n⏱️  Time Consuming:")
-    print(f"  - Add Dialogue: {add_dialogue_duration_time:.2f} min")
-    print(f"  - Search Memory: {search_memory_duration_time:.2f} min")
-    print(f"  - Total: {add_dialogue_duration_time + search_memory_duration_time:.2f} min")
-    print("=" * 80)
-
+# ==================== Entry Point ====================
 
 def main(
     data_path: str,
     top_k: int = 20,
     user_num: int = 1,
-    max_concurrency: int = 2,
+    max_concurrency: int = 2
 ):
-    """Synchronous entry point."""
-    asyncio.run(main_async(data_path, top_k, user_num, max_concurrency))
+    """Main entry point."""
+    config = EvalConfig(
+        data_path=data_path,
+        top_k=top_k,
+        user_num=user_num,
+        max_concurrency=max_concurrency
+    )
+    
+    evaluator = HaluMemEvaluator(config)
+    asyncio.run(evaluator.run_evaluation())
 
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Simplified evaluation for ReMe on HaluMem benchmark (QA only)")
+    
+    parser = argparse.ArgumentParser(
+        description="Evaluate ReMe on HaluMem benchmark (Question Answering)"
+    )
     parser.add_argument(
         "--data_path",
         type=str,
         required=True,
-        help="Path to HaluMem data file (e.g., HaluMem-medium.jsonl)",
+        help="Path to HaluMem JSONL file"
     )
     parser.add_argument(
         "--top_k",
         type=int,
         default=20,
-        help="Number of top memories to retrieve (default: 20)",
+        help="Number of memories to retrieve (default: 20)"
     )
     parser.add_argument(
         "--user_num",
         type=int,
         default=1,
-        help="Number of users to evaluate (default: 1)",
+        help="Number of users to evaluate (default: 1)"
     )
     parser.add_argument(
         "--max_concurrency",
         type=int,
         default=2,
-        help="Maximum concurrency for processing (default: 2)",
+        help="Maximum concurrent user processing (default: 2)"
     )
+    
     args = parser.parse_args()
-
+    
     main(
         data_path=args.data_path,
         top_k=args.top_k,
         user_num=args.user_num,
-        max_concurrency=args.max_concurrency,
+        max_concurrency=args.max_concurrency
     )
