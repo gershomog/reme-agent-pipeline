@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -496,6 +497,13 @@ class HaluMemEvaluatorV3:
         
         # Clear existing data
         await self.reme.vector_store.delete_all()
+        
+        # Clear meta_memory directory
+        meta_memory_path = Path(f"meta_memory/{self.reme.vector_store.collection_name}")
+        if meta_memory_path.exists():
+            shutil.rmtree(meta_memory_path)
+            logger.info(f"Cleared meta_memory directory: {meta_memory_path}")
+        meta_memory_path.mkdir(parents=True, exist_ok=True)
         
         # Load user data
         all_users = self.data_loader.load_jsonl(self.config.data_path)

@@ -49,7 +49,7 @@ class ReadUserProfile(BaseMemoryTool):
         # Convert to MemoryNode objects and sort by conversation_time (oldest first)
         memory_nodes = [MemoryNode(**node_data) for node_data in cached_data]
         memory_nodes.sort(
-            key=lambda node: node.metadata.get("conversation_time", "")
+            key=lambda n: n.metadata.get("conversation_time", "")
         )
 
         memory_formated = []
