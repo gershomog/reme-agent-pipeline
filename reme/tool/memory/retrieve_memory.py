@@ -11,29 +11,34 @@ from ...core.utils import deduplicate_memories
 class RetrieveMemory(BaseMemoryTool):
     """Tool to retrieve memories using similarity search"""
 
-    def __init__(self, top_k: int = 20, enable_memory_target: bool = False, **kwargs):
+    def __init__(self, top_k: int = 20, enable_memory_target: bool = False, enable_time_filter: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.top_k: int = top_k
         self.enable_memory_target: bool = enable_memory_target
+        self.enable_time_filter: bool = enable_time_filter
 
     def _build_query_parameters(self) -> dict:
         """Build the query parameters schema based on enabled features."""
         properties = {
             "query": {
                 "type": "string",
-                "description": "query text for vector similarity search.",
-            },
-            "time_range": {
-                "type": "string",
-                "description": "optional time range filter. Format: '20200101' or '20200101,20200102'",
+                "description": "query",
             },
         }
         required = ["query"]
 
+        if self.enable_time_filter:
+            properties["time_filter"] = {
+                "type": "string",
+                "description": "Optional time filter to narrow down search results by date. "
+                               "Format: single date '20200101' for exact date match, "
+                               "or date range '20200101,20200102' for inclusive range filtering.",
+            }
+
         if self.enable_memory_target:
             properties["memory_target"] = {
                 "type": "string",
-                "description": "target memory type to search in.",
+                "description": "memory_target",
             }
             required.append("memory_target")
 
@@ -46,7 +51,7 @@ class RetrieveMemory(BaseMemoryTool):
     def _build_tool_call(self) -> ToolCall:
         return ToolCall(
             **{
-                "description": "retrieve memories using vector similarity search.",
+                "description": "Retrieve relevant memories from the vector store using semantic similarity search.",
                 "parameters": self._build_query_parameters(),
             },
         )
@@ -54,13 +59,13 @@ class RetrieveMemory(BaseMemoryTool):
     def _build_multiple_tool_call(self) -> ToolCall:
         return ToolCall(
             **{
-                "description": "retrieve memories using multiple queries with vector similarity search.",
+                "description": "Retrieve relevant memories from the vector store using semantic similarity search.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query_items": {
                             "type": "array",
-                            "description": "list of query items for vector similarity search.",
+                            "description": "List of query items.",
                             "items": self._build_query_parameters(),
                         },
                     },
@@ -85,14 +90,14 @@ class RetrieveMemory(BaseMemoryTool):
                 queries_by_target[target] = []
 
             filters = {}
-            time_range = item.get("time_range")
-            if time_range:
-                time_range = time_range.strip()
-                if "," in time_range:
-                    start, end = time_range.split(",")
+            time_filter = item.get("time_filter")
+            if time_filter:
+                time_filter = time_filter.strip()
+                if "," in time_filter:
+                    start, end = time_filter.split(",")
                     filters = {"time_int": [int(start.strip()), int(end.strip())]}
                 else:
-                    filters = {"time_int": [int(time_range), int(time_range)]}
+                    filters = {"time_int": [int(time_filter), int(time_filter)]}
 
             queries_by_target[target].append({
                 "query": item["query"],
