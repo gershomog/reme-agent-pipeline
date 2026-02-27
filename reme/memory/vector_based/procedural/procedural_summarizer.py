@@ -1,47 +1,84 @@
-"""Procedural memory summarizer agent implementation."""
+"""Procedural memory summarizer agent for extracting and storing procedural knowledge."""
+
+from loguru import logger
 
 from ..base_memory_agent import BaseMemoryAgent
 from ....core.enumeration import Role, MemoryType
+from ....core.op import BaseTool
 from ....core.schema import Message
-from ....core.utils import format_messages
 
 
 class ProceduralSummarizer(BaseMemoryAgent):
-    """Agent responsible for summarizing procedural memories."""
+    """Extract and store procedural memories from task execution trajectories.
+
+    Procedural memories capture "how-to" knowledge including:
+    - Successful workflows and step-by-step approaches
+    - Lessons learned from failures and mistakes
+    - Best practices and optimization patterns
+    - Task execution strategies and techniques
+    """
 
     memory_type: MemoryType = MemoryType.PROCEDURAL
 
     async def build_messages(self) -> list[Message]:
+        """Build messages for procedural memory extraction."""
         return [
             Message(
-                role=Role.SYSTEM,
+                role=Role.USER,
                 content=self.prompt_format(
-                    prompt_name="system_prompt",
-                    context=self.description + "\n" + format_messages(self.get_messages()),
-                    outcome="successful task completion" if self.success else "task failure",
+                    prompt_name="user_message",
+                    context=self.context.history_node.content,
                     memory_type=self.memory_type.value,
                     memory_target=self.memory_target,
                 ),
             ),
-            Message(
-                role=Role.USER,
-                content=self.get_prompt("user_message"),
-            ),
         ]
 
-    async def _reasoning_step(self, messages: list[Message], step: int, **kwargs) -> tuple[Message, bool]:
-        return await super()._reasoning_step(messages, step, **kwargs)
-
-    async def _acting_step(self, assistant_message: Message, step: int, **kwargs) -> list[Message]:
-        """Execute tool calls with memory_target, memory_type, and author context."""
-        messages: list[Message] = await super()._acting_step(
+    async def _acting_step(
+        self,
+        assistant_message: Message,
+        tools: list[BaseTool],
+        step: int,
+        stage: str = "",
+        **kwargs,
+    ) -> tuple[list[BaseTool], list[Message]]:
+        """Execute tool calls with memory context."""
+        return await super()._acting_step(
             assistant_message,
+            tools,
             step,
+            stage=stage,
             memory_type=self.memory_type.value,
             memory_target=self.memory_target,
-            ref_memory_id=self.ref_memory_id,
+            history_node=self.history_node,
             author=self.author,
+            retrieved_nodes=self.retrieved_nodes,
             **kwargs,
         )
 
-        return messages
+    async def execute(self):
+        """Execute procedural memory extraction."""
+        # Log available tools
+        for i, tool in enumerate(self.tools):
+            logger.info(f"[{self.__class__.__name__}] tool_call[{i}]={tool.tool_call.simple_input_dump(as_dict=False)}")
+
+        messages = await self.build_messages()
+        for i, message in enumerate(messages):
+            role = message.name or message.role
+            logger.info(f"[{self.__class__.__name__}] role={role} {message.simple_dump(as_dict=False)}")
+
+        tools, messages, success = await self.react(messages, self.tools)
+
+        answer = messages[-1].content if success and messages else ""
+        memory_nodes = []
+        for tool in tools:
+            if tool.memory_nodes:
+                memory_nodes.extend(tool.memory_nodes)
+
+        return {
+            "answer": answer,
+            "success": success,
+            "messages": messages,
+            "tools": tools,
+            "memory_nodes": memory_nodes,
+        }
