@@ -208,10 +208,21 @@ class SearchStep(BaseStep):
         if strict_date_filter:
             search_filter["strict_date_filter"] = True
 
-        vector_results, keyword_results = await asyncio.gather(
-            self.file_store.vector_search(query, candidates, search_filter),
-            self.file_store.keyword_search(query, candidates, search_filter),
-        )
+        text_weight = 1.0 - vector_weight
+        use_vector = vector_weight > 0.0
+        use_keyword = text_weight > 0.0
+
+        if use_vector and use_keyword:
+            vector_results, keyword_results = await asyncio.gather(
+                self.file_store.vector_search(query, candidates, search_filter),
+                self.file_store.keyword_search(query, candidates, search_filter),
+            )
+        elif use_vector:
+            vector_results = await self.file_store.vector_search(query, candidates, search_filter)
+            keyword_results = []
+        else:
+            vector_results = []
+            keyword_results = await self.file_store.keyword_search(query, candidates, search_filter)
 
         self.logger.info(
             f"[{self.name}] query={query!r} candidates={candidates} "
