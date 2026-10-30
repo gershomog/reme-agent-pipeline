@@ -2256,3 +2256,58 @@ async def test_embedding_reindex_completes_when_a_chunk_exceeds_the_provider_lim
         assert long_text not in provider.embedded_texts
 
         await store.close()
+
+
+@pytest.mark.parametrize("store_factory", [_new_local_store, _new_faiss_store, _new_zvec_store])
+@pytest.mark.parametrize("long_chars", [5000, 2400])
+@pytest.mark.parametrize("enable_cache", [False, True])
+@pytest.mark.asyncio
+async def test_second_reindex_recovers_the_same_over_limit_chunk(store_factory, long_chars, enable_cache):
+    """The repeat rebuild must clear the gate again, not only the first one.
+
+    #683 is an availability bug: reindex never finished. The test above covers the first
+    rebuild; this one raises the gate a second time and requires the same over-limit chunk
+    to be recovered again, with the embedding cache both off and on.
+    """
+    with tempfile.TemporaryDirectory() as tmp, temp_chdir(tmp):
+        store = store_factory(name=f"t_reindex_twice_{long_chars}_{enable_cache}")
+        await store.start()
+        long_text = "x" * long_chars
+        await set_chunks_with_graph(
+            store,
+            {
+                "good": chunk("good", "a.md", "alpha text"),
+                "long": chunk("long", "b.md", long_text),
+            },
+        )
+        provider = OverLimitAsEmbedding(max_chars=2048)
+        embedding = LocalEmbeddingStore(
+            name=f"t_reindex_twice_embedding_{long_chars}_{enable_cache}",
+            enable_cache=enable_cache,
+            max_input_length=8192,
+        )
+        embedding.as_embedding = provider
+        store.embedding_store = embedding
+        _ensure_zvec_collection(store)
+        if isinstance(store, FaissLocalFileStore):
+            store._rebuild_index()
+        elif isinstance(store, ZvecLocalFileStore):
+            store._rebuild_collection()
+
+        shortened = long_text
+        while len(shortened) > 2048:
+            shortened = shortened[: len(shortened) // 2]
+
+        for round_index in (1, 2):
+            await store.require_embedding_rebuild()
+            result = await store.reindex("embedding")
+
+            assert result == {"indexed": 2, "scope": "embedding"}
+            assert store._embedding_rebuild_pending is False
+            assert provider.embedded_texts.count(shortened) >= 1, f"rebuild {round_index}"
+
+        # Without a cache each rebuild has to reach the provider again; with one, the
+        # second rebuild is served from it and the shortened request is sent only once.
+        assert provider.embedded_texts.count(shortened) == (1 if enable_cache else 2)
+
+        await store.close()
